@@ -1,1 +1,0 @@
-# spark-transactions-pipeline
