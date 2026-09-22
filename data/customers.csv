@@ -1,0 +1,21 @@
+customer_id,customer_name,province,created_at
+C0001,Customer 1,Hanoi,2024-01-13 00:00:00
+C0002,Customer 2,DaNang,2024-05-05 00:00:00
+C0003,Customer 3,HoChiMinh,2024-03-12 00:00:00
+C0004,Customer 4,Hanoi,2024-10-06 00:00:00
+C0005,Customer 5,Hanoi,2024-08-04 00:00:00
+C0006,Customer 6,Hanoi,2024-01-16 00:00:00
+C0007,Customer 7,Hanoi,2024-04-21 00:00:00
+C0008,Customer 8,HoChiMinh,2024-09-15 00:00:00
+C0009,Customer 9,CanTho,2024-01-14 00:00:00
+C0010,Customer 10,CanTho,2024-04-11 00:00:00
+C0011,Customer 11,CanTho,2024-08-02 00:00:00
+C0012,Customer 12,HoChiMinh,2024-08-17 00:00:00
+C0013,Customer 13,CanTho,2024-05-22 00:00:00
+C0014,Customer 14,Hanoi,2024-03-22 00:00:00
+C0015,Customer 15,HaiPhong,2024-06-23 00:00:00
+C0016,Customer 16,DaNang,2024-03-20 00:00:00
+C0017,Customer 17,HoChiMinh,2024-06-21 00:00:00
+C0018,Customer 18,Hanoi,2024-02-17 00:00:00
+C0019,Customer 19,HaiPhong,2024-02-19 00:00:00
+C0020,Customer 20,DaNang,2024-06-25 00:00:00
