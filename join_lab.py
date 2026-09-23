@@ -71,6 +71,7 @@ orders_schema = StructType([
     StructField("status",        StringType(), True),
     StructField("order_time",    TimestampType(), True),  # transaction_time -> order_time
     StructField("updated_at",    TimestampType(), True),
+    StructField("order_date",    StringType(), True),  # bổ sung, không dùng trong bài join này nhưng khai đủ theo file thật
 ])
 
 customers_df = spark.read.option("header", True).schema(customers_schema).csv(customers_csv)
