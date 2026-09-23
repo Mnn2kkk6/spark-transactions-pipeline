@@ -49,6 +49,7 @@ transactions_schema = StructType([
     StructField("status",            StringType(), True),
     StructField("transaction_time",  TimestampType(), True),
     StructField("updated_at",        TimestampType(), True),
+    StructField("order_date",        StringType(), True),  # bổ sung: phần ngày của transaction_time, dùng cho bài Partitioning
 ])
 
 customers_df = (
