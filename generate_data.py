@@ -119,7 +119,7 @@ random.shuffle(rows)
 with open(f"{OUT_DIR}/transactions.csv", "w", newline="", encoding="utf-8") as f:
     w = csv.writer(f)
     w.writerow(
-        ["transaction_id", "customer_id", "amount", "status", "transaction_time", "updated_at"]
+        ["transaction_id", "customer_id", "amount", "status", "transaction_time", "updated_at", "order_date"]
     )
     for r in rows:
         tid, cid, amount, status, t_time, updated_at = r
@@ -131,6 +131,7 @@ with open(f"{OUT_DIR}/transactions.csv", "w", newline="", encoding="utf-8") as f
                 status,
                 t_time.strftime("%Y-%m-%d %H:%M:%S"),
                 updated_at.strftime("%Y-%m-%d %H:%M:%S"),
+                t_time.strftime("%Y-%m-%d"),  # order_date: bổ sung, lấy phần ngày của transaction_time
             ]
         )
 
