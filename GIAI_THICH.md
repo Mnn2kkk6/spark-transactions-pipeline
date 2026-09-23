@@ -1,5 +1,10 @@
 # Giải thích pipeline (Spark: raw → validate → dedup → join → window → aggregate → partitioned output)
 
+> **Cập nhật**: `data/transactions.csv` hiện có thêm cột `order_date` (phần ngày của
+> `transaction_time`), được bổ sung để dùng chung dữ liệu cho bài **Partitioning &
+> Performance** (`partitioning_lab.py`, xem [`PARTITIONING_LAB_GIAI_THICH.md`](./PARTITIONING_LAB_GIAI_THICH.md)).
+> Cột này không ảnh hưởng gì đến logic validate/dedup/join/aggregate mô tả dưới đây.
+
 Toàn bộ code đã chạy thật với PySpark 4.2.0 (local mode). Số liệu dưới đây lấy từ `pipeline_run_log.txt`:
 
 ```
