@@ -1,0 +1,258 @@
+
+==============================================================================
+BƯỚC 0: Sinh dữ liệu: 1,000,000 transactions, 20,000 customers (8 partition đầu vào; skew: 60% dòng dồn vào C00000)
+==============================================================================
+tx (đều)   : 8 partition
+tx_skew    : 8 partition
+customers  : 1 partition
+
+==============================================================================
+BƯỚC 1: Operation nào gây Shuffle? (đếm node trong physical plan)
+==============================================================================
+Case                                  Loại                                 Exchange Broadcast  Sort
+---------------------------------------------------------------------------------------------------
+filter + select + withColumn          narrow                                      0         0     0
+coalesce(2)                           narrow (gộp, không shuffle)                 0         0     0
+repartition(8)                        wide                                        1         0     0
+groupBy(customer_id).agg(sum)         wide                                        1         0     0
+distinct(customer_id)                 wide                                        1         0     0
+orderBy(amount)                       wide                                        1         0     1
+Window row_number() by customer       wide                                        1         0     1
+join - Sort-Merge (hint merge)        wide (2 phía đều shuffle)                   2         0     2
+join - Broadcast (bảng nhỏ)           wide nhưng KHÔNG shuffle bảng lớn           0         1     0
+repartition(cid) rồi groupBy(cid)     shuffle 1 lần, dùng lại                     1         0     0
+
+Nhận xét:
+ - narrow (filter/select/withColumn/coalesce): 0 Exchange.
+ - groupBy / distinct / orderBy / Window / repartition: mỗi cái 1 Exchange. groupBy+agg còn
+   được Spark tách thành HashAggregate(partial) -> Exchange -> HashAggregate(final): gom sơ bộ
+   ở từng partition TRƯỚC khi shuffle để giảm lượng dữ liệu phải chuyển.
+ - Sort-Merge Join: 2 Exchange (shuffle CẢ HAI bảng theo khoá join) + 2 Sort.
+ - Broadcast Join: 0 Exchange cho bảng lớn; chỉ có BroadcastExchange (gửi bảng nhỏ tới mọi executor).
+ - repartition(cid) rồi groupBy(cid): chỉ 1 Exchange, vì dữ liệu ĐÃ được chia theo cid nên groupBy
+   không cần shuffle lần nữa -> repartition sớm theo key hữu ích khi có nhiều bước cùng key.
+Số partition sau shuffle = spark.sql.shuffle.partitions (đang đặt 8; mặc định của Spark là 200).
+  groupBy -> số partition kết quả: 8
+
+==============================================================================
+BƯỚC 2: Broadcast Join vs Sort-Merge Join
+==============================================================================
+spark.sql.autoBroadcastJoinThreshold = 10485760b
+Join KHÔNG hint -> plan: {'Range': 2, 'Project': 3, 'BroadcastExchange': 1, 'BroadcastHashJoin': 1}
+
+--- Plan SORT-MERGE JOIN (2 Exchange + 2 Sort: shuffle cả 2 bảng) ---
+* Project (10)
++- * SortMergeJoin Inner (9)
+   :- * Sort (4)
+   :  +- Exchange (3)
+   :     +- * Project (2)
+   :        +- * Range (1)
+   +- * Sort (8)
+      +- Exchange (7)
+         +- * Project (6)
+            +- * Range (5)
+
+--- Plan BROADCAST HASH JOIN (BroadcastExchange, không Exchange cho bảng lớn) ---
+* Project (7)
++- * BroadcastHashJoin Inner BuildRight (6)
+   :- * Project (2)
+   :  +- * Range (1)
+   +- BroadcastExchange (5)
+      +- * Project (4)
+         +- * Range (3)
+
+Thời gian join 1,000,000 tx x 20,000 customers (best of 2):
+  Sort-Merge Join :   2.15s   (shuffle + sort cả 2 bảng)
+  Broadcast Join  :   1.25s   (không shuffle bảng lớn)
+  => Broadcast nhanh hơn 1.7x  (thời gian phụ thuộc máy, xem chỉ số shuffle bên dưới)
+
+Dữ liệu shuffle-write của cả job (từ Spark REST API):
+  Sort-Merge Join :     21.0 MB,  1,020,000 records
+  Broadcast Join  :      0.0 MB,          0 records
+  [OK] cùng kết quả: 1,000,000 dòng, tổng amount = 2,510,731,948,503.55
+
+Khi nào dùng / không dùng Broadcast Join:
+ - Dùng khi 1 bên đủ nhỏ để nằm gọn trong bộ nhớ của driver + MỌI executor (mặc định < 10MB,
+   chỉnh bằng spark.sql.autoBroadcastJoinThreshold hoặc ép bằng F.broadcast()/hint("broadcast")).
+ - Không dùng khi bảng "nhỏ" thực ra lớn: broadcast tốn bộ nhớ driver (phải collect về trước)
+   + nhân bản ra mọi executor -> dễ OOM. Khi đó Sort-Merge Join hợp lý hơn.
+ - Không broadcast được bên "được giữ lại" của outer join (vd left join thì không broadcast
+   được bảng bên trái) - bảng nhỏ phải là bên còn lại.
+ - Broadcast Join còn TRÁNH được skew phía join: bảng lớn không bị shuffle theo key.
+
+==============================================================================
+BƯỚC 3: Cache / Persist
+==============================================================================
+--- KHÔNG cache: mỗi action tính lại join + groupBy từ đầu ---
+   count()                 3.40s
+   tổng theo province      3.03s
+   top 10 customer         2.85s
+   TỔNG                    9.28s
+
+--- CÓ cache: action đầu tiên nạp cache, các action sau đọc từ bộ nhớ ---
+   gọi .cache()            0.08s   <- gần 0: cache là lazy, chưa tính gì
+   is_cached = True, storageLevel sau cache(): Disk Memory Deserialized 1x Replicated
+   count()                 2.58s
+   tổng theo province      0.46s
+   top 10 customer         0.19s
+   TỔNG                    3.23s
+   => Có cache nhanh hơn 2.9x (action đầu vẫn trả giá tính toán, các action sau gần như miễn phí)
+
+Plan khi đã cache: query mới đọc từ InMemoryTableScan (các node bên dưới InMemoryRelation
+chỉ là plan đã dùng để NẠP cache, không chạy lại):
+* HashAggregate (17)
++- Exchange (16)
+   +- * HashAggregate (15)
+      +- InMemoryTableScan (1)
+            +- InMemoryRelation (2)
+                  +- * HashAggregate (14)
+                     +- * HashAggregate (13)
+                        +- * Project (12)
+                           +- * SortMergeJoin Inner (11)
+                              :- * Sort (6)
+                              :  +- Exchange (5)
+                              :     +- * Project (4)
+                              :        +- * Range (3)
+                              +- * Sort (10)
+                                 +- Exchange (9)
+                                    +- * Project (8)
+                                       +- * Range (7)
+
+Sau unpersist(): is_cached = False  (nhả bộ nhớ khi hết dùng)
+persist(MEMORY_AND_DISK): storageLevel = Disk Memory Serialized 1x Replicated
+
+Khi nào nên / không nên cache:
+ - NÊN: DataFrame tốn kém (nhiều shuffle/join) và được DÙNG LẠI >= 2 action / nhiều nhánh xử lý.
+ - KHÔNG NÊN: chỉ dùng 1 lần (cache thêm overhead, không lợi gì); dữ liệu quá lớn so với
+   bộ nhớ (bị đẩy ra đĩa hoặc bị evict); hoặc quên unpersist() làm chiếm bộ nhớ cả job.
+ - persist(level) cho phép chọn MEMORY_ONLY / MEMORY_AND_DISK / DISK_ONLY...;
+   cache() = persist() với level mặc định.
+ - Cache chỉ tồn tại trong 1 Spark application, không thay thế việc ghi checkpoint/Parquet.
+
+==============================================================================
+BƯỚC 4a: Phát hiện skew
+==============================================================================
+Top 5 customer_id theo số transaction (tx_skew, tổng 1,000,000):
+   C00000:   599,983  (60.0%)
+   C12470:        37  (0.0%)
+   C09643:        35  (0.0%)
+   C06443:        34  (0.0%)
+   C10365:        33  (0.0%)
+Bình thường mỗi customer có ~ 50 dòng -> hot key gấp hàng trăm lần.
+
+Số dòng mỗi partition sau khi chia theo customer_id (đây là thứ Sort-Merge Join / groupBy sẽ thấy):
+   tx (đều)  : [125350, 128050, 121850, 126650, 122100, 125950, 124200, 125850]
+      -> partition lớn nhất chứa 128,050/1,000,000 dòng (13%); lớn nhất / median = 1.0x
+   tx_skew   : [650021, 51515, 48691, 50791, 48527, 50355, 49957, 50143]
+      -> partition lớn nhất chứa 650,021/1,000,000 dòng (65%); lớn nhất / median = 12.9x
+
+==============================================================================
+BƯỚC 4b: Skew làm task chậm bất thường (đo thời gian từng task)
+==============================================================================
+Sort-Merge Join theo customer_id, stage reduce (đọc shuffle):
+   [dữ liệu ĐỀU ] stage 68: thời gian task median=116ms, max=198ms (x1.7) | dòng shuffle-read median=128,367, max=130,611 (x1.0)
+   [dữ liệu LỆCH ] stage 71: thời gian task median=56ms, max=627ms (x11.2) | dòng shuffle-read median=52,874, max=652,528 (x12.3)
+=> Trong 1 stage, thời gian stage ~ thời gian task CHẬM NHẤT. Ở cluster nhiều core, các core còn lại xong sớm rồi ngồi chờ 1 task straggler.
+
+==============================================================================
+BƯỚC 4c: Xử lý skew bằng SALTING
+==============================================================================
+(i) Aggregate với salting 2 giai đoạn
+   Phân bố dòng theo partition nếu shuffle theo key:
+     customer_id          : [650021, 51515, 48691, 50791, 48527, 50355, 49957, 50143]
+      -> partition lớn nhất chứa 650,021/1,000,000 dòng (65%); lớn nhất / median = 12.9x
+     (customer_id, salt)  : [125066, 50533, 125063, 275269, 125241, 124787, 49188, 124853]
+      -> partition lớn nhất chứa 275,269/1,000,000 dòng (28%); lớn nhất / median = 2.2x
+   Số salt bucket ảnh hưởng độ đều thế nào (shuffle 8 partition; hash có thể đụng nhau nên không bao giờ đều tuyệt đối):
+      8 salt bucket: partition lớn nhất chiếm 28% tổng số dòng  (đổi lại bảng nhỏ phải nhân bản x8)
+     16 salt bucket: partition lớn nhất chiếm 24% tổng số dòng  (đổi lại bảng nhỏ phải nhân bản x16)
+     32 salt bucket: partition lớn nhất chiếm 20% tổng số dòng  (đổi lại bảng nhỏ phải nhân bản x32)
+   [OK] kết quả aggregate sau salting KHỚP kết quả gốc trên cả 20,000 customer
+
+(ii) Join với salting: bảng nhỏ nhân bản x8 (20,000 -> 160,000 dòng), join theo (customer_id, salt)
+   Stage reduce của Sort-Merge Join:
+   [LỆCH, chưa salt] stage 71: thời gian task median=56ms, max=627ms (x11.2) | dòng shuffle-read median=52,874, max=652,528 (x12.3)
+   [LỆCH, đã salt   ] stage 115: thời gian task median=132ms, max=383ms (x2.9) | dòng shuffle-read median=144,982, max=295,277 (x2.0)
+   Tổng thời gian trên máy local này: chưa salt 2.00s | đã salt 2.71s
+   LƯU Ý: thời gian (ms) của từng task dao động khá nhiều giữa các lần chạy trên máy ít core, đừng tin 1 con số.
+   Chỉ số ỔN ĐỊNH và đáng tin là SỐ DÒNG mà task lớn nhất phải xử lý (cột shuffle-read max).
+   Tổng thời gian local có thể không giảm (salting còn tốn thêm do nhân bản bảng nhỏ); lợi ích thật xuất hiện
+   trên cluster nhiều core, nơi thời gian stage ~ thời gian task chậm nhất.
+   [OK] join sau salting cho cùng kết quả: 1,000,000 dòng, tổng amount = 2,510,731,948,503.56
+
+Các cách xử lý skew khác (không chạy trong bài này):
+ - Broadcast Join nếu 1 bên đủ nhỏ (tránh shuffle bảng lớn -> hết skew phía join).
+ - Tách riêng hot key: xử lý hot key bằng broadcast / logic riêng, phần còn lại join bình thường.
+ - Lọc key rác trước khi join (vd customer_id null/rỗng dồn về 1 partition).
+ - Bật AQE skew join (bước 4d): Spark tự chia partition quá lớn thành nhiều mảnh.
+
+==============================================================================
+BƯỚC 4d: AQE skew join (Spark tự xử lý skew lúc runtime)
+==============================================================================
+Plan cuối cùng của AQE có node `SortMergeJoin(skew=true)`: True
+    AQE đã phát hiện partition lệch và chia nhỏ nó thành nhiều task.
+       (5) AQEShuffleRead
+       Arguments: skewed
+       (11) AQEShuffleRead
+       (13) SortMergeJoin(skew=true) [codegen id : 5]
+   [AQE bật      ] stage 129: thời gian task median=64ms, max=262ms (x4.1) | dòng shuffle-read median=53,324, max=165,094 (x3.1)
+
+==============================================================================
+BƯỚC 5: Đọc explain() của 1 query đầy đủ
+==============================================================================
+Cây plan (đọc từ DƯỚI lên TRÊN = thứ tự thực thi; thụt vào nhiều hơn = chạy trước):
+* Sort (13)
++- Exchange (12)
+   +- * HashAggregate (11)
+      +- Exchange (10)
+         +- * HashAggregate (9)
+            +- * Project (8)
+               +- * BroadcastHashJoin Inner BuildRight (7)
+                  :- * Filter (3)
+                  :  +- * Project (2)
+                  :     +- * Range (1)
+                  +- BroadcastExchange (6)
+                     +- * Project (5)
+                        +- * Range (4)
+
+Đếm node: {'Range': 2, 'Project': 3, 'Filter': 1, 'BroadcastExchange': 1, 'BroadcastHashJoin': 1, 'HashAggregate': 2, 'Exchange': 2, 'Sort': 1}
+
+Ý nghĩa các node có trong plan này:
+   Range                nguồn dữ liệu (ở pipeline thật là Scan csv/parquet)
+   Project              narrow: chọn / tính cột, không shuffle
+   Filter               narrow: lọc từng dòng, không shuffle
+   BroadcastExchange    gửi bảng nhỏ tới mọi executor (KHÔNG phải shuffle bảng lớn)
+   BroadcastHashJoin    join bằng hash table của bảng đã broadcast
+   HashAggregate        aggregate; xuất hiện 2 lần = partial (trước shuffle) + final (sau shuffle)
+   Exchange             SHUFFLE - ranh giới stage, tốn đĩa + mạng
+   Sort                 sắp xếp trong partition (cho ORDER BY / Sort-Merge Join / Window)
+
+Số Exchange (shuffle) trong plan = 2  ->  job chính có ~ 3 stage (mỗi shuffle cắt 1 stage).
+Thực tế Spark chạy nhiều JOB cho 1 action, mỗi job có số stage riêng:
+   job 47: 1 stage
+   job 48: 2 stage
+   job 49: 3 stage
+   (job có ít stage hơn thường là job build BroadcastExchange và job lấy mẫu chia range cho orderBy; job nhiều stage nhất là job chính)
+   [OK] job chính có 3 stage = số Exchange + 1
+
+Cách đọc nhanh 1 plan khi tối ưu:
+ 1. Đếm Exchange: càng nhiều càng tốn; tự hỏi có bỏ bớt / dùng lại được không
+    (vd repartition sớm theo key chung, broadcast bảng nhỏ, gộp bước groupBy).
+ 2. Thấy SortMergeJoin + 2 Exchange + 2 Sort mà 1 bên nhỏ -> cân nhắc F.broadcast().
+ 3. Exchange hashpartitioning(key, N): kiểm tra key có bị skew không, N (shuffle.partitions) có hợp lý không.
+ 4. Exchange rangepartitioning + Sort ở cuối = ORDER BY toàn cục; nếu không cần thứ tự toàn cục
+    thì bỏ orderBy hoặc dùng sortWithinPartitions.
+ 5. Cache xong mà plan vẫn không có InMemoryTableScan -> cache chưa được dùng (chưa action nào nạp cache
+    hoặc plan dùng nhánh khác).
+
+==============================================================================
+TỔNG KẾT SỐ LIỆU
+==============================================================================
+Dữ liệu: 1,000,000 transactions x 20,000 customers
+Join      : Sort-Merge 2.15s vs Broadcast 1.25s  ->  Broadcast nhanh hơn 1.7x
+Cache     : 3 action không cache 9.28s vs có cache 3.23s  ->  nhanh hơn 2.9x
+Data skew : task chậm nhất của stage join (ms) - số tuyệt đối dao động giữa các lần chạy, xem xu hướng:
+            dữ liệu đều 198ms | lệch 627ms | lệch + salting 383ms | lệch + AQE skew join 262ms
+            dòng shuffle-read của task lớn nhất: đều 130,611 | lệch 652,528 | salting 295,277 | AQE 165,094
+
+DONE.
